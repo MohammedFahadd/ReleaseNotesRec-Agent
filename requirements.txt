@@ -9,8 +9,8 @@ python-dateutil==2.9.0.post0        # <-- added for date parsing (time windows)
 # --- RAG / embeddings ---
 datasets==2.20.0
 sentence-transformers==2.6.1
-faiss-cpu==1.8.0.post1
-torch==2.3.1
+faiss-cpu==1.13.0
+torch==2.6.0
 
 # --- LLMs (Gemini via LangChain) ---
 google-generativeai==0.8.3
@@ -25,3 +25,4 @@ uvicorn[standard]==0.30.6
 protobuf==5.29.2
 grpcio==1.64.1
 urllib3==2.2.3                     # <-- added to support Retry & HTTPAdapter safely
+numpy<2.0.0,>=1.26.4

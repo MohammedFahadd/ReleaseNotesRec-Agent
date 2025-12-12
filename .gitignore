@@ -102,3 +102,9 @@ results/
 
 # Project-specific
 ollama.tar.gz  
+
+# Vector stores / local DB artifacts
+chroma_db/
+release_notes_store/
+*.index
+*.faiss
