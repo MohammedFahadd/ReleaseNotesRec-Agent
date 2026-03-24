@@ -1,130 +1,167 @@
-# ReleaseNotesRec-RAG
+# 💬 Release Notes Chat — Live API + RAG Assistant
 
-## Overview
-
-This project is a **Release-Notes Chatbot** built with a RAG (Retrieval-Augmented Generation) architecture in Streamlit. It ingests:
-
-- **OS release notes** via API  
-- **Reddit discussions** via API  
-- **User feedback** from a CSV file  
-
-Data is embedded with `sentence-transformers`, indexed using FAISS, and queried via an Azure OpenAI deployment.
+An intelligent software update assistant that combines **live vendor data (GitHub, CISA, APIs)** with **Retrieval-Augmented Generation (RAG)** to deliver accurate, real-time, and contextual answers.
 
 ---
 
-## Features
+## 🚀 Features
 
-- **Data ingestion** from:
-  - CSV (`SoftwareUpdateSurvey.csv`)
-  - OS API: `https://releasetrain.io/api/component?q=os`
-  - Reddit API: `https://releasetrain.io/api/reddit`
-- **Embeddings** using `all-mpnet-base-v2`
-- **Persistent FAISS** vector store
-  - “🔄 Refresh data” button re-indexes and resets cache
-- **Streamlit UI**:
-  - Top-K slider to control retrieval depth
-  - Scrollable chat history
-  - Real-time assistant responses
-- **Azure OpenAI** integration:
-  - Uses new `AzureOpenAI` SDK if available
-  - Falls back to legacy `openai` client for compatibility
+- 🔍 **Live Data Integration**
+  - GitHub Releases API
+  - CISA Known Exploited Vulnerabilities (KEV)
+  - OS & Reddit APIs
+  - Atom/RSS feeds
+
+- 🧠 **RAG (Retrieval-Augmented Generation)**
+  - FAISS vector search
+  - Sentence Transformers embeddings
+  - Context retrieval from local dataset (`SoftwareUpdateSurvey.csv`)
+
+- ⚡ **Smart Query Routing**
+  - Automatically detects vendor (Python, Kubernetes, Redis, etc.)
+  - Routes to correct data source
+  - Supports natural language queries
+
+- ⏱️ **Time-Aware Filtering**
+  - Queries like:
+    - "last month"
+    - "October 2025"
+    - "last quarter"
+    - "week 42 of 2025"
+
+- 🔄 **Smart Fallback System**
+  - If exact results are not found → returns closest matches
+  - Avoids empty or misleading responses
+
+- 💬 **LLM-Powered Summarization**
+  - Uses Gemini (via LangChain)
+  - Combines live + RAG data into clean answers
+
+- 🎨 **Modern Chat UI**
+  - Inspired by ChatGPT / Perplexity
+  - Inline source links
+  - Response timing (Total / Live / RAG)
 
 ---
 
-## Requirements
+## 🏗️ Architecture
 
-- **Python 3.11+**
+<img width="252" height="220" alt="image" src="https://github.com/user-attachments/assets/b726308e-9da4-4eeb-964b-03fc75cd58d7" />
 
-Create a file named `.env` in the project root with:
+---
 
+## 📦 Tech Stack
+
+- **Frontend/UI:** Streamlit  
+- **LLM:** Google Gemini (via LangChain)  
+- **Vector DB:** FAISS  
+- **Embeddings:** Sentence Transformers  
+- **Data Sources:**
+  - GitHub Releases API
+  - CISA KEV Feed
+  - Custom APIs (OS + Reddit)
+- **Backend Logic:** Python  
+
+---
+
+## ⚙️ Setup
+
+### 1. Clone the repo
 ```bash
-AZURE_OPENAI_ENDPOINT=<your-endpoint>
-AZURE_OPENAI_KEY=<your-key>
-AZURE_OPENAI_DEPLOYMENT=<deployment-name>  # e.g. gpt-4o
-AZURE_OPENAI_API_VERSION=2025-01-01-preview
-```
+git clone https://github.com/your-username/your-repo.git
+cd your-repo
 
-❗**Important:** Do NOT commit your `.env` file to version control.  
-Make sure `.env` is listed in your `.gitignore`.
+## Install dependencies
 
-Install dependencies with:
+**pip install -r requirements.txt
 
-```bash
-pip install -r requirements.txt
-```
+## Add environment variables
 
----
+**Create a .env file:
+**GOOGLE_API_KEY=your_api_key_here
 
-## Usage
+## Run the app
 
-1. **Clone** the repo  
-   ```bash
-   git clone https://github.com/SE4CPS/ReleaseNotesRec-RAG.git
-   cd ReleaseNotesRec-RAG
-   ```
-2. **Add** your Azure credentials to a `.env` file  
-3. **Install** required packages  
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. **Launch** the Streamlit app  
-   ```bash
-   streamlit run app.py
-   ```
+**streamlit run app.py
 
----
+🧪 Example Queries
 
-## Configuration
+Try these:
 
-- **CSV path**: `SoftwareUpdateSurvey.csv`
-- **OS API**: `https://releasetrain.io/api/component?q=os`
-- **Reddit API**: `https://releasetrain.io/api/reddit`
-- **Embedding model**: change `EMB_MODEL` in `app.py` if needed
+🔍 Releases
+	•	“Grafana releases in 2025”
+	•	“Python versions released in 2024”
+	•	“Redis updates this year”
 
----
+⏱️ Time-based
+	•	“Node.js patches September 2025”
+	•	“Linux kernel updates last month”
+	•	“TensorFlow releases last quarter”
 
-## System Prompt
+🔐 Security
+	•	“CVEs in October 2025”
+	•	“latest vulnerabilities in Linux”
+	•	“critical security issues this month”
 
-We use a chain-of-thought style prompt (not shown to the user) to guide reasoning:
+🤯 Complex queries
+	•	“Kubernetes updates and vulnerabilities last month”
+	•	“Docker releases and user issues recently”
+	•	“TensorFlow updates and security fixes”
 
-1. Understand the user query  
-2. Retrieve relevant documents  
-3. Form reasoning internally  
-4. Provide a clear answer  
-5. Say “I do not know.” if unsure
+⸻
 
----
+🧠 How It Works
+	1.	Understands your query
+	•	Detects vendor + time range
+	2.	Fetches live data
+	•	GitHub / CISA / APIs
+	3.	Retrieves context (RAG)
+	•	From local dataset + embeddings
+	4.	Combines everything
+	•	Gemini generates final answer
+	5.	Displays results
+	•	Clean UI + clickable sources
 
-## Example Query
+⸻
 
-```text
-User: What are the known security vulnerabilities in the latest Nvidia drivers?
-```
+📊 Performance
 
-**Assistant** will summarize the most recent CVEs and provide update recommendations based on the retrieved context.
+Each response includes:
+	•	⏱️ Total Time
+	•	⚡ Live API Time
+	•	🧠 RAG Retrieval Time
 
----
+⸻
 
-## Project Structure
+🔐 Notes
+	•	.env file is required (API key not included)
+	•	Large vector store is generated locally
+	•	Cached API responses improve performance
 
-```
-.
-├── app.py                      # Streamlit app with Azure RAG integration
-├── SoftwareUpdateSurvey.csv   # User feedback CSV
-├── requirements.txt           # Dependencies
-├── .env                       # Azure credentials (NOT committed)
-├── release_notes_store/       # Cached vector store (auto-generated)
-├── README.md
-```
+⸻
 
----
+🎯 Use Cases
+	•	Software release tracking
+	•	Security vulnerability monitoring
+	•	Developer research assistant
+	•	DevOps / SRE tooling
+	•	AI-powered tech insights
 
-## Contributing
+⸻
 
-Feel free to open issues or submit pull requests to improve this project.
+🚀 Future Improvements
+	•	Multi-step reasoning agents
+	•	Streaming responses
+	•	More vendor integrations
+	•	UI enhancements (charts, timelines)
+	•	Deployment (Docker + cloud)
 
----
+⸻
 
-## License
+👨‍💻 Author
 
-This project is licensed under MIT. See [LICENSE](LICENSE) for details.
+Mohammed Fahad
+MS Computer Science — University of the Pacific
+
+
+
