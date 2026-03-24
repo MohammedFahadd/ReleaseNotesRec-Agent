@@ -1,59 +1,142 @@
 # app.py
 from langchain_google_genai import ChatGoogleGenerativeAI
-import os, shutil, requests, pandas as pd, streamlit as st
+ChatGoogleGenerativeAI.model_rebuild()
+
+import os
+import shutil
+import requests
+import pandas as pd
+import streamlit as st
 from dotenv import load_dotenv
 from datasets import Dataset, DatasetDict, load_from_disk
 from sentence_transformers import SentenceTransformer
 
-# NEW ↓
-import distutils_shim
-import re, json, calendar, time
+import re
+import json
+import calendar
+import feedparser
 from datetime import datetime, timedelta, timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from pathlib import Path
 from dateutil.relativedelta import relativedelta
-import feedparser
-from urllib.parse import urlencode
-from concurrent.futures import ThreadPoolExecutor, as_completed
-# NEW ↑
+from time import perf_counter
 
 st.set_page_config("Release-Notes Chat", "💬")
 
+st.markdown("""
+<style>
+html, body, [data-testid="stAppViewContainer"] {
+  background: #0b1020;
+  color: #f3f6ff;
+}
+
+[data-testid="stHeader"] {
+  background: transparent;
+}
+
+.block-container {
+  max-width: 980px;
+  padding-top: 1.2rem;
+}
+
+[data-testid="stChatInput"] {
+  position: sticky;
+  bottom: 10px;
+}
+
+[data-testid="stChatInput"] > div {
+  background: rgba(18, 24, 40, 0.95);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 16px;
+}
+
+.query-card {
+  background: linear-gradient(90deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 16px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  font-weight: 600;
+}
+
+.live-chip {
+  color: #b9c2d9;
+  font-size: 0.92rem;
+  margin: 4px 0 10px 2px;
+}
+
+.answer-card {
+  background: transparent;
+  border-radius: 14px;
+  padding: 0;
+}
+
+.answer-card p, .answer-card li {
+  line-height: 1.7;
+}
+
+.answer-card ul {
+  margin-top: 0.4rem;
+}
+
+a {
+  color: #8fb2ff !important;
+  text-decoration: none !important;
+}
+
+a:hover {
+  text-decoration: underline !important;
+}
+
+[data-testid="stCaptionContainer"] {
+  color: #b9c2d9;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ── creds ────────────────────────────────────────────────────────────────────
 load_dotenv()
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 if not GOOGLE_API_KEY:
-    st.error("Set GOOGLE_API_KEY in your .env"); st.stop()
+    try:
+        GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+    except Exception:
+        GOOGLE_API_KEY = ""
 
-# Optional but recommended for higher NVD quotas
-NVD_API_KEY = os.getenv("NVD_API_KEY", "")
+if not GOOGLE_API_KEY:
+    st.error("Set GOOGLE_API_KEY in your .env or Streamlit secrets")
+    st.stop()
 
-_gem = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)
+os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+
+_gem = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
 
 # ── data / embedding config ─────────────────────────────────────────────────
-CSV_PATH   = "SoftwareUpdateSurvey.csv"
-OS_API     = "https://releasetrain.io/api/component?q=os"
+CSV_PATH = "SoftwareUpdateSurvey.csv"
+OS_API = "https://releasetrain.io/api/component?q=os"
 REDDIT_API = "https://releasetrain.io/api/reddit"
 MAX_OS, MAX_RED = 50, 50
-EMB_MODEL  = "sentence-transformers/all-mpnet-base-v2"
-DATA_DIR   = "release_notes_store"
+EMB_MODEL = "sentence-transformers/all-mpnet-base-v2"
+DATA_DIR = "release_notes_store"
 FAISS_PATH = os.path.join(DATA_DIR, "faiss.index")
 
-# Cache (no seeds)
-CACHE_DIR = Path(".live_cache"); CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR = Path(".live_cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
 # -------------------------- one-time status chips ---------------------------
 if "live_marks" not in st.session_state:
     st.session_state.live_marks = set()
 
+
 def mark_live(name: str):
-    """Show a '✓ <name>: live' chip only once per session."""
     if name not in st.session_state.live_marks:
         st.session_state.live_marks.add(name)
         st.caption(f"✓ {name}: live")
 
-# -------------------------- utilities / fetch --------------------------------
+
+# -------------------------- utilities / fetch -------------------------------
 def _normalize_results(payload):
     if isinstance(payload, list):
         return payload
@@ -61,54 +144,71 @@ def _normalize_results(payload):
         return payload["results"]
     return []
 
+
+def clean_html(text: str):
+    text = text or ""
+    text = re.sub(r"<.*?>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _get_json(url: str, name: str, headers: dict | None = None):
-    """Resilient fetch with retry -> cache (no UI side-effects here)."""
     safe = re.sub(r"[^a-z0-9]+", "_", f"{name}_{url}".lower()).strip("_")
     cache_path = CACHE_DIR / f"{safe}.json"
 
     sess = requests.Session()
-    retry = Retry(total=2, backoff_factor=0.7, status_forcelist=(502,503,504),
-                  allowed_methods=frozenset(["GET"]))
-    sess.mount("http://", HTTPAdapter(max_retries=retry))
-    sess.mount("https://", HTTPAdapter(max_retries=retry))
+
+    retry = Retry(
+        total=2,
+        backoff_factor=0.7,
+        status_forcelist=(502, 503, 504),
+        allowed_methods=["GET"],
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
 
     try:
-        base_headers = {"User-Agent":"ReleaseNotesRec/1.0"}
+        base_headers = {"User-Agent": "ReleaseNotesRec/1.0"}
         if headers:
             base_headers.update(headers)
-        r = sess.get(url, timeout=12, headers=base_headers)
-        if r.status_code == 200 and "json" in r.headers.get("content-type",""):
-            data = r.json()
-            try: cache_path.write_text(json.dumps(data), encoding="utf-8")
-            except Exception: pass
-            return data
-        raise RuntimeError(f"HTTP {r.status_code} {r.headers.get('content-type','')}")
-    except Exception as e:
-        if cache_path.exists():
-            try:
-                data = json.loads(cache_path.read_text(encoding="utf-8"))
-                return data
-            except Exception:
-                pass
-        st.warning(f"{name} fetch error from {url}: {e}")
-        return None
 
-# ---------------- natural-language time & dynamic vendor filters --------------
+        r = sess.get(url, timeout=12, headers=base_headers)
+
+        if r.status_code == 200:
+            data = r.json()
+            cache_path.write_text(json.dumps(data), encoding="utf-8")
+            return data
+
+    except Exception:
+        pass
+
+    if cache_path.exists():
+        return json.loads(cache_path.read_text())
+
+    return None
+
+
+# ---------------- natural-language time & filters ---------------------------
 _MONTHS = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 _WEEK_REX = re.compile(r"\bweek\s+(\d{1,2})\s+of\s+(\d{4})\b", re.I)
+
 
 def _as_utc(dt):
     if not dt.tzinfo:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+
 def _parse_isoish(s: str | None):
-    if not s: return None
+    if not s:
+        return None
     try:
         s = s.replace("Z", "+00:00").split(".")[0]
         return _as_utc(datetime.fromisoformat(s))
     except Exception:
         return None
+
 
 def parse_time_window(q: str, now=None):
     q = (q or "").strip()
@@ -117,42 +217,73 @@ def parse_time_window(q: str, now=None):
 
     if "yesterday" in rel:
         d = now.date() - timedelta(days=1)
-        return (datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc),
-                datetime.combine(d, datetime.max.time(), tzinfo=timezone.utc))
+        return (
+            datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc),
+            datetime.combine(d, datetime.max.time(), tzinfo=timezone.utc),
+        )
+
     if "last week" in rel:
-        monday = (now - timedelta(days=now.weekday()+7)).date()
+        monday = (now - timedelta(days=now.weekday() + 7)).date()
         sunday = monday + timedelta(days=6)
-        return (datetime.combine(monday, datetime.min.time(), tzinfo=timezone.utc),
-                datetime.combine(sunday, datetime.max.time(), tzinfo=timezone.utc))
+        return (
+            datetime.combine(monday, datetime.min.time(), tzinfo=timezone.utc),
+            datetime.combine(sunday, datetime.max.time(), tzinfo=timezone.utc),
+        )
+
     if "this week" in rel:
         monday = (now - timedelta(days=now.weekday())).date()
         sunday = monday + timedelta(days=6)
-        return (datetime.combine(monday, datetime.min.time(), tzinfo=timezone.utc),
-                datetime.combine(sunday, datetime.max.time(), tzinfo=timezone.utc))
+        return (
+            datetime.combine(monday, datetime.min.time(), tzinfo=timezone.utc),
+            datetime.combine(sunday, datetime.max.time(), tzinfo=timezone.utc),
+        )
+
     if "last month" in rel:
         first = (now.replace(day=1) - relativedelta(months=1)).date()
-        last  = (now.replace(day=1) - timedelta(days=1)).date()
-        return (datetime.combine(first, datetime.min.time(), tzinfo=timezone.utc),
-                datetime.combine(last, datetime.max.time(), tzinfo=timezone.utc))
+        last = (now.replace(day=1) - timedelta(days=1)).date()
+        return (
+            datetime.combine(first, datetime.min.time(), tzinfo=timezone.utc),
+            datetime.combine(last, datetime.max.time(), tzinfo=timezone.utc),
+        )
+
     if "this month" in rel:
         first = now.replace(day=1).date()
         last_day = calendar.monthrange(now.year, now.month)[1]
-        last = datetime(now.year, now.month, last_day, 23,59,59, tzinfo=timezone.utc)
-        return (datetime.combine(first, datetime.min.time(), tzinfo=timezone.utc), last)
+        last = datetime(now.year, now.month, last_day, 23, 59, 59, tzinfo=timezone.utc)
+        return datetime.combine(first, datetime.min.time(), tzinfo=timezone.utc), last
+
     if "last year" in rel:
-        start = datetime(now.year-1, 1, 1, tzinfo=timezone.utc)
-        end   = datetime(now.year-1, 12, 31, 23,59,59, tzinfo=timezone.utc)
+        start = datetime(now.year - 1, 1, 1, tzinfo=timezone.utc)
+        end = datetime(now.year - 1, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
         return start, end
+
     if "this year" in rel:
         start = datetime(now.year, 1, 1, tzinfo=timezone.utc)
-        end   = datetime(now.year, 12, 31, 23,59,59, tzinfo=timezone.utc)
+        end = datetime(now.year, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+        return start, end
+
+    if "last quarter" in rel:
+        current_quarter = (now.month - 1) // 3 + 1
+        year = now.year
+        last_quarter = current_quarter - 1
+        if last_quarter == 0:
+            last_quarter = 4
+            year -= 1
+        start_month = (last_quarter - 1) * 3 + 1
+        end_month = start_month + 2
+        start = datetime(year, start_month, 1, tzinfo=timezone.utc)
+        last_day = calendar.monthrange(year, end_month)[1]
+        end = datetime(year, end_month, last_day, 23, 59, 59, tzinfo=timezone.utc)
         return start, end
 
     m = _WEEK_REX.search(q)
     if m:
-        wk = int(m.group(1)); yr = int(m.group(2))
+        wk = int(m.group(1))
+        yr = int(m.group(2))
         monday = datetime.fromisocalendar(yr, wk, 1).replace(tzinfo=timezone.utc)
-        sunday = datetime.fromisocalendar(yr, wk, 7).replace(tzinfo=timezone.utc, hour=23, minute=59, second=59)
+        sunday = datetime.fromisocalendar(yr, wk, 7).replace(
+            tzinfo=timezone.utc, hour=23, minute=59, second=59
+        )
         return monday, sunday
 
     for name, idx in _MONTHS.items():
@@ -161,125 +292,272 @@ def parse_time_window(q: str, now=None):
             yr = int(m2.group(1))
             first = datetime(yr, idx, 1, tzinfo=timezone.utc)
             last_day = calendar.monthrange(yr, idx)[1]
-            last = datetime(yr, idx, last_day, 23,59,59, tzinfo=timezone.utc)
+            last = datetime(yr, idx, last_day, 23, 59, 59, tzinfo=timezone.utc)
             return first, last
 
-    rng = re.search(r"(between|from)\s+([A-Za-z0-9,\-\s/]+)\s+(and|to)\s+([A-Za-z0-9,\-\s/]+)", q, re.I)
+    rng = re.search(
+        r"(between|from)\s+([A-Za-z0-9,\-\s/]+)\s+(and|to)\s+([A-Za-z0-9,\-\s/]+)",
+        q,
+        re.I,
+    )
     if rng:
         def _try_dt(t):
             for fmt in ("%Y-%m-%d", "%b %d, %Y", "%Y/%m/%d"):
-                try: return _as_utc(datetime.strptime(t.strip(), fmt))
-                except Exception: pass
+                try:
+                    return _as_utc(datetime.strptime(t.strip(), fmt))
+                except Exception:
+                    pass
             return None
-        s = _try_dt(rng.group(2)); e = _try_dt(rng.group(4))
-        if s and e and s <= e: return s, e + timedelta(hours=23, minutes=59, seconds=59)
+
+        s = _try_dt(rng.group(2))
+        e = _try_dt(rng.group(4))
+        if s and e and s <= e:
+            return s, e + timedelta(hours=23, minutes=59, seconds=59)
 
     mdate = re.search(r"\bon\s+(\d{4}-\d{2}-\d{2})\b", q)
     if mdate:
         d = datetime.strptime(mdate.group(1), "%Y-%m-%d").date()
-        return (datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc),
-                datetime.combine(d, datetime.max.time(), tzinfo=timezone.utc))
+        return (
+            datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc),
+            datetime.combine(d, datetime.max.time(), tzinfo=timezone.utc),
+        )
 
-    y = re.search(r"\bin\s+(20\d{2}|19\d{2})\b", q)
+    y = re.search(r"\b(20\d{2}|19\d{2})\b", q)
     if y:
         yr = int(y.group(1))
-        return (datetime(yr,1,1, tzinfo=timezone.utc), datetime(yr,12,31,23,59,59, tzinfo=timezone.utc))
+        return (
+            datetime(yr, 1, 1, tzinfo=timezone.utc),
+            datetime(yr, 12, 31, 23, 59, 59, tzinfo=timezone.utc),
+        )
 
     return None
 
-# ---- Dynamic vendor tokens (no hard-coded list) ----
-_STOP = {
-    "the","a","an","and","or","to","for","of","on","in","at","by","with","from",
-    "is","are","was","were","be","been","am","as","about","this","that","these",
-    "those","any","latest","new","update","updates","driver","drivers","patch","patches",
-    "version","versions","issues","issue","problem","problems","bug","bugs"
-}
+
+def is_release_query(q: str):
+    ql = (q or "").lower()
+    release_terms = {"release", "releases", "version", "versions", "update", "updates", "patch", "patches", "announcement", "history"}
+    return any(term in ql for term in release_terms)
+
+
+def is_rc_query(q: str):
+    ql = (q or "").lower()
+    return " rc " in f" {ql} " or "release candidate" in ql or "rc builds" in ql
+
+
 def extract_vendors(q: str):
-    if not q: return []
-    raw = re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]+", q)
-    toks = []
-    for t in raw:
-        t2 = t.lower()
-        if len(t2) < 3: continue
-        if t2 in _STOP: continue
-        toks.append(t2)
-    seen, out = set(), []
-    for t in toks:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out  # [] => no vendor filter
+    if not q:
+        return []
+
+    ql = q.lower()
+
+    alias_map = {
+        "postgresql": "postgresql",
+        "postgres": "postgres",
+        "postgre": "postgres",
+        "k8s": "kubernetes",
+        "kubernetes": "kubernetes",
+        "docker": "docker",
+        "grafana": "grafana",
+        "redis": "redis",
+        "cpython": "python",
+        "python": "python",
+        "golang": "golang",
+        "go": "golang",
+        "mongodb": "mongodb",
+        "mongo": "mongodb",
+        "mysql": "mysql",
+        "nginx": "nginx",
+        "tensorflow": "tensorflow",
+        "tf": "tensorflow",
+        "pytorch": "pytorch",
+        "torch": "pytorch",
+        "ubuntu": "ubuntu",
+        "linux": "linux",
+        "kernel": "kernel",
+        "windows": "windows",
+        "debian": "debian",
+        "android": "android",
+        "ios": "ios",
+        "macos": "macos",
+        "nvidia": "nvidia",
+        "node.js": "node",
+        "nodejs": "node",
+        "node": "node",
+        "openssl": "openssl",
+        "microsoft": "windows",
+    }
+
+    found = []
+    for alias, canonical in alias_map.items():
+        if re.search(rf"\b{re.escape(alias)}\b", ql):
+            found.append(canonical)
+
+    if not found:
+        if "python" in ql:
+            found.append("python")
+        elif "grafana" in ql:
+            found.append("grafana")
+        elif "kubernetes" in ql or "k8s" in ql:
+            found.append("kubernetes")
+        elif "redis" in ql:
+            found.append("redis")
+        elif "docker" in ql:
+            found.append("docker")
+        elif "node" in ql:
+            found.append("node")
+        elif "tensorflow" in ql:
+            found.append("tensorflow")
+
+    seen = set()
+    out = []
+    for v in found:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
 
 def filter_by_time_and_vendor(items, start_end, vendors):
     def _dt(it):
-        return (_parse_isoish(it.get("updatedAt") or it.get("createdAt") or
-                              it.get("date") or it.get("published") or it.get("created_utc")))
+        return _parse_isoish(
+            it.get("updatedAt")
+            or it.get("createdAt")
+            or it.get("date")
+            or it.get("published")
+            or it.get("published_at")
+            or it.get("created_utc")
+        )
+
     out = []
     for it in items:
         dt = _dt(it)
         if start_end:
-            s,e = start_end
-            if not dt or not (s <= dt <= e): continue
+            s, e = start_end
+            if not dt or not (s <= dt <= e):
+                continue
         if vendors:
-            hay = " ".join(str(it.get(k,"")) for k in ("title","name","versionProductName","versionReleaseNotes","summary","description")).lower()
-            if not any(v in hay for v in vendors): continue
+            hay = " ".join(
+                str(it.get(k, "")) for k in (
+                    "title", "name", "versionProductName", "versionReleaseNotes",
+                    "summary", "description", "repo"
+                )
+            ).lower()
+            if not any(v in hay for v in vendors):
+                continue
         out.append(it)
     return out
 
-def build_grounded_answer(title, items, limit=8):
-    if not items:
-        return f"**{title}**\n\n_No matching items in the selected time window and filters._"
-    lines = [f"**{title}**"]
-    for it in items[:limit]:
-        t = it.get("title") or it.get("name") or it.get("versionProductName") or "Untitled"
-        url = it.get("url") or it.get("link") or ""
-        dt  = (_parse_isoish(it.get('updatedAt') or it.get('createdAt') or it.get('date') or it.get('published') or it.get('created_utc')))
-        ds  = dt.date().isoformat() if dt else ""
-        notes = (it.get("versionReleaseNotes") or it.get("summary") or it.get("description") or it.get("content") or "")
-        blurb = (notes[:220] + "…") if notes and len(notes) > 220 else notes
-        if url: lines.append(f"- **{t}** — {blurb}  _(date: {ds})_  • [source]({url})")
-        else:   lines.append(f"- **{t}** — {blurb}  _(date: {ds})_")
-    return "\n\n".join(lines)
 
-# ------------------------------ ingestion ------------------------------------
+def filter_rc_only(items):
+    out = []
+    for it in items:
+        title = (it.get("title") or "").lower()
+        summary = (it.get("summary") or "").lower()
+        if "rc" in title or "release candidate" in summary:
+            out.append(it)
+    return out
+
+
+def build_grounded_answer(title, items, limit=5):
+    if not items:
+        return ""
+
+    lines = []
+
+    for it in items[:limit]:
+        t = clean_html(it.get("title") or it.get("name") or it.get("versionProductName") or "Untitled")
+        url = it.get("url") or it.get("link") or ""
+
+        t = re.sub(r"Download page.*", "", t)
+        t = re.sub(r"What's new.*", "", t)
+
+        dt = _parse_isoish(
+            it.get("updatedAt")
+            or it.get("createdAt")
+            or it.get("date")
+            or it.get("published")
+            or it.get("published_at")
+            or it.get("created_utc")
+        )
+        ds = dt.date().isoformat() if dt else ""
+
+        if url:
+            lines.append(f"- **{t.strip()}** ({ds}) [source]({url})")
+        else:
+            lines.append(f"- **{t.strip()}** ({ds})")
+
+    return "\n".join(lines)
+
+
+# ------------------------------ ingestion (RAG) -----------------------------
 def load_csv(path):
     try:
         df = pd.read_csv(path)
-    except Exception as e:
-        st.error(f"CSV load failed: {e}")
+    except Exception:
         return []
-    return [{"text": "\n".join(f"{c}: {row[c]}" for c in df.columns if pd.notna(row[c]))}
-            for _, row in df.iterrows()]
+
+    return [
+        {"text": "\n".join(f"{c}: {row[c]}" for c in df.columns if pd.notna(row[c]))}
+        for _, row in df.iterrows()
+    ]
+
 
 def fetch(url, max_items, mapping, name):
     raw = _get_json(url, name=name)
     if raw is None:
         return []
-    data = _normalize_results(raw) or (raw if isinstance(raw, list) else [])
-    return [{"text": "\n".join(f"{k}: {item.get(v, '')}" for k, v in mapping.items())}
-            for item in data[:max_items]]
 
-# ── Vector store ───────────────────────────────────────────────────────────
+    data = _normalize_results(raw) or (raw if isinstance(raw, list) else [])
+    return [
+        {"text": "\n".join(f"{k}: {item.get(v, '')}" for k, v in mapping.items())}
+        for item in data[:max_items]
+    ]
+
+
 def build_store():
-    docs  = load_csv(CSV_PATH)
-    docs += fetch(OS_API, MAX_OS, {"OS_ID":"_id","OS_Name":"versionProductName",
-                                   "OS_ReleaseNotes":"versionReleaseNotes"}, name="os")
-    docs += fetch(REDDIT_API, MAX_RED, {"REDDIT_ID":"_id","Subreddit":"subreddit",
-                                        "Title":"title","URL":"url"}, name="reddit")
+    docs = load_csv(CSV_PATH)
+    docs += fetch(
+        OS_API,
+        MAX_OS,
+        {
+            "OS_ID": "_id",
+            "OS_Name": "versionProductName",
+            "OS_ReleaseNotes": "versionReleaseNotes",
+        },
+        name="os",
+    )
+    docs += fetch(
+        REDDIT_API,
+        MAX_RED,
+        {
+            "REDDIT_ID": "_id",
+            "Subreddit": "subreddit",
+            "Title": "title",
+            "URL": "url",
+        },
+        name="reddit",
+    )
+
     model = SentenceTransformer(EMB_MODEL)
-    ds = DatasetDict({"train": Dataset.from_dict({"text":[d["text"] for d in docs]})})
-    ds = ds.map(lambda b: {"embeddings": model.encode(b["text"], batch_size=16, show_progress_bar=False)},
-                batched=True, batch_size=16)
+    ds = DatasetDict({"train": Dataset.from_dict({"text": [d["text"] for d in docs]})})
+    ds = ds.map(
+        lambda b: {"embeddings": model.encode(b["text"], batch_size=16, show_progress_bar=False)},
+        batched=True,
+        batch_size=16,
+    )
+
     shutil.rmtree(DATA_DIR, ignore_errors=True)
     os.makedirs(DATA_DIR, exist_ok=True)
     ds.save_to_disk(DATA_DIR)
     ds["train"].add_faiss_index("embeddings")
     ds["train"].save_faiss_index("embeddings", FAISS_PATH)
 
+
 def load_store():
     ds = load_from_disk(DATA_DIR)
     ds["train"].load_faiss_index("embeddings", FAISS_PATH)
     return SentenceTransformer(EMB_MODEL), ds
+
 
 @st.cache_resource(show_spinner="Loading vector store…")
 def get_store():
@@ -288,17 +566,143 @@ def get_store():
         return load_store()
     try:
         return load_store()
-    except Exception as e:
-        st.warning(f"Vector store load failed ({e}); rebuilding once…")
+    except Exception:
         shutil.rmtree(DATA_DIR, ignore_errors=True)
         build_store()
         return load_store()
 
+
 embedder, datastore = get_store()
 
-# ── Extra live vendor feeds (pluggable) ─────────────────────────────────────
+
+def retrieve(query, k):
+    emb = embedder.encode(query, show_progress_bar=False)
+    _, ex = datastore["train"].get_nearest_examples("embeddings", emb, k=k)
+    return ex["text"]
+
+
+SYSTEM_PROMPT = (
+    "Answer using the provided context. Prefer live vendor-routed results as the primary source of truth. "
+    "Use RAG context to add background or clarification, not to override live facts. "
+    "Do not invent facts."
+)
+
+
+def call_llm(msgs):
+    prompt = "\n\n".join(f"{m['role'].upper()}:\n{m['content']}" for m in msgs)
+    resp = _gem.invoke(prompt)
+    return getattr(resp, "content", str(resp))
+
+
+def make_msgs(user_q, ctx_docs):
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": "\n\n".join(f"Document {i+1}:\n{d[:1000]}" for i, d in enumerate(ctx_docs)),
+        },
+        {"role": "user", "content": user_q},
+    ]
+
+
+def combine_live_and_rag(user_q, live_answer, rag_answer):
+    prompt = f"""
+You are answering a software update question.
+
+User query:
+{user_q}
+
+Live vendor-routed results:
+{live_answer}
+
+RAG context:
+{rag_answer}
+
+Instructions:
+- Prefer live vendor-routed results as the primary source of truth.
+- Use RAG only to add helpful context.
+- If live results exist, summarize them confidently.
+- If exact matches are unavailable but close vendor matches exist, present them as the closest relevant results.
+- Do not say the information is unavailable unless both live and RAG are empty.
+- Write one polished final answer in a single section.
+- Use 1 short intro sentence and then 2 to 5 bullet points when appropriate.
+- Preserve inline markdown hyperlinks like [source](...) when useful.
+- Do not create a separate Sources section.
+- Keep the tone concise and presentation-ready.
+"""
+    resp = _gem.invoke(prompt)
+    return getattr(resp, "content", str(resp))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_github_releases(repo: str, limit: int = 30):
+    url = f"https://api.github.com/repos/{repo}/releases"
+    headers = {"Accept": "application/vnd.github+json"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return [
+                {
+                    "repo": repo,
+                    "title": rel.get("name") or rel.get("tag_name") or "Untitled",
+                    "summary": (rel.get("body") or "")[:500],
+                    "url": rel.get("html_url") or "",
+                    "published": rel.get("published_at") or rel.get("created_at"),
+                }
+                for rel in data[:limit]
+            ]
+        return []
+    except Exception:
+        return []
+
+
+def fetch_json_generic(url: str, list_path: list[str], field_map: dict, name: str):
+    data = _get_json(url, name=name) or {}
+    lst = data
+    try:
+        for key in list_path:
+            lst = lst.get(key, [])
+    except Exception:
+        lst = []
+
+    out = []
+    for it in lst:
+        out.append(
+            {
+                "title": next((it.get(p) for p in field_map.get("title", []) if it.get(p)), it.get("title")) or "Untitled",
+                "summary": next((it.get(p) for p in field_map.get("summary", []) if it.get(p)), it.get("summary")) or "",
+                "url": next((it.get(p) for p in field_map.get("url", []) if it.get(p)), it.get("url")) or "",
+                "published": next((it.get(p) for p in field_map.get("published", []) if it.get(p)), it.get("published")) or it.get("date"),
+            }
+        )
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_atom_rss(url: str, name: str):
+    try:
+        fp = feedparser.parse(url)
+    except Exception:
+        return []
+
+    out = []
+    for e in fp.entries[:100]:
+        out.append(
+            {
+                "title": e.get("title", "Untitled"),
+                "summary": e.get("summary", "") or (
+                    e.get("content", [{}])[0].get("value", "") if e.get("content") else ""
+                ),
+                "url": e.get("link", ""),
+                "published": e.get("published") or e.get("updated"),
+            }
+        )
+    return out
+
+
+# ── Extra live feeds ────────────────────────────────────────────────────────
 SOURCES = {
-    # Security aggregators
     "cisa_kev": {
         "kind": "json",
         "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
@@ -310,394 +714,252 @@ SOURCES = {
             "published": ["dateAdded"],
         },
     },
-
-    # Popular GitHub projects (releases)
-    "github_chromium":   {"kind":"atom", "url":"https://github.com/chromium/chromium/releases.atom"},
-    "github_kubernetes": {"kind":"atom", "url":"https://github.com/kubernetes/kubernetes/releases.atom"},
-    "github_openssl":    {"kind":"atom", "url":"https://github.com/openssl/openssl/releases.atom"},
-    "github_node":       {"kind":"atom", "url":"https://github.com/nodejs/node/releases.atom"},
-    "github_python":     {"kind":"atom", "url":"https://github.com/python/cpython/releases.atom"},
-    "github_postgres":   {"kind":"atom", "url":"https://github.com/postgres/postgres/releases.atom"},
-    "github_nginx":      {"kind":"atom", "url":"https://github.com/nginx/nginx/releases.atom"},
-    "github_redis":      {"kind":"atom", "url":"https://github.com/redis/redis/releases.atom"},
-    "github_linux":      {"kind":"atom", "url":"https://github.com/torvalds/linux/releases.atom"},
-    "github_v8":         {"kind":"atom", "url":"https://github.com/v8/v8/releases.atom"},
-    "github_docker":     {"kind":"atom", "url":"https://github.com/docker/cli/releases.atom"},
-    "github_containerd": {"kind":"atom", "url":"https://github.com/containerd/containerd/releases.atom"},
-    "github_istio":      {"kind":"atom", "url":"https://github.com/istio/istio/releases.atom"},
-    "github_grafana":    {"kind":"atom", "url":"https://github.com/grafana/grafana/releases.atom"},
-    "github_prometheus": {"kind":"atom", "url":"https://github.com/prometheus/prometheus/releases.atom"},
-    "github_openvpn":    {"kind":"atom", "url":"https://github.com/OpenVPN/openvpn/releases.atom"},
-    "github_vscode":     {"kind":"atom", "url":"https://github.com/microsoft/vscode/releases.atom"},
-    "github_tensorflow": {"kind":"atom", "url":"https://github.com/tensorflow/tensorflow/releases.atom"},
-    "github_pytorch":    {"kind":"atom", "url":"https://github.com/pytorch/pytorch/releases.atom"},
-    "github_mariadb":    {"kind":"atom", "url":"https://github.com/MariaDB/server/releases.atom"},
-    "github_mongodb":    {"kind":"atom", "url":"https://github.com/mongodb/mongo/releases.atom"},
-    "github_elasticsearch":{"kind":"atom","url":"https://github.com/elastic/elasticsearch/releases.atom"},
-    "github_kafka":      {"kind":"atom","url":"https://github.com/apache/kafka/releases.atom"},
-    "github_spark":      {"kind":"atom","url":"https://github.com/apache/spark/releases.atom"},
-    "github_airflow":    {"kind":"atom","url":"https://github.com/apache/airflow/releases.atom"},
-    "github_flask":      {"kind":"atom","url":"https://github.com/pallets/flask/releases.atom"},
-    "github_django":     {"kind":"atom","url":"https://github.com/django/django/releases.atom"},
-    "github_fastapi":    {"kind":"atom","url":"https://github.com/fastapi/fastapi/releases.atom"},
-    "github_rx":         {"kind":"atom","url":"https://github.com/rust-lang/rust/releases.atom"},
-    "github_go":         {"kind":"atom","url":"https://github.com/golang/go/releases.atom"},
+    "github_linux": {"kind": "atom", "url": "https://github.com/torvalds/linux/releases.atom"},
+    "github_kubernetes": {"kind": "atom", "url": "https://github.com/kubernetes/kubernetes/releases.atom"},
+    "github_docker": {"kind": "atom", "url": "https://github.com/docker/cli/releases.atom"},
 }
 
-def _take(d, path_list):
-    for p in path_list:
-        v = d.get(p)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
+GITHUB_VENDOR_REPOS = {
+    "kubernetes": "kubernetes/kubernetes",
+    "docker": "docker/cli",
+    "python": "python/cpython",
+    "grafana": "grafana/grafana",
+    "redis": "redis/redis",
+    "node": "nodejs/node",
+    "nginx": "nginx/nginx",
+    "tensorflow": "tensorflow/tensorflow",
+    "pytorch": "pytorch/pytorch",
+    "postgres": "postgres/postgres",
+    "postgresql": "postgres/postgres",
+    "mysql": "mysql/mysql-server",
+    "mongodb": "mongodb/mongo",
+    "golang": "golang/go",
+    "go": "golang/go",
+    "linux": "torvalds/linux",
+}
 
-def _isoish_any(x):
-    if not x: return None
-    if isinstance(x, str): return x
-    try:
-        return datetime(*x[:6], tzinfo=timezone.utc).isoformat()
-    except Exception:
-        return None
+ATOM_VENDOR_SOURCES = {
+    "linux": ["github_linux"],
+    "kernel": ["github_linux"],
+    "kubernetes": ["github_kubernetes"],
+    "docker": ["github_docker"],
+}
 
-def fetch_json_generic(url: str, list_path: list[str], field_map: dict, name: str):
-    data = _get_json(url, name=name) or {}
-    lst = data
-    try:
-        for key in list_path:
-            lst = lst.get(key, [])
-    except Exception:
-        lst = []
-    out = []
-    for it in lst:
-        out.append({
-            "title":     _take(it, field_map.get("title", [])) or it.get("title") or "Untitled",
-            "summary":   _take(it, field_map.get("summary", [])) or it.get("summary", ""),
-            "url":       _take(it, field_map.get("url", [])) or it.get("url", ""),
-            "published": _take(it, field_map.get("published", [])) or it.get("published") or it.get("date"),
-        })
-    return out
+DISCUSSION_HINTS = {
+    "reddit", "discussion", "discussions", "user", "users", "complaint",
+    "complaints", "report", "reports", "issue", "issues", "bug", "bugs", "feedback",
+}
 
-def fetch_atom_rss(url: str, name: str):
-    try:
-        fp = feedparser.parse(url)
-    except Exception:
-        return []
-    out = []
-    for e in fp.entries[:200]:
-        out.append({
-            "title": e.get("title", "Untitled"),
-            "summary": e.get("summary", "") or (e.get("content", [{}])[0].get("value", "") if e.get("content") else ""),
-            "url": e.get("link", ""),
-            "published": _isoish_any(e.get("published_parsed") or e.get("updated_parsed")),
-        })
-    return out
+SECURITY_HINTS = {
+    "cve", "cves", "vulnerability", "vulnerabilities", "security", "exploit",
+    "exploited", "kev", "severity",
+}
 
-# ── NVD helpers (fixed RFC3339 .000Z + chunking) ────────────────────────────
-NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-def _fmt_nvd(dt: datetime) -> str:
-    # NVD is strict about RFC3339; use constant microseconds .000Z
-    return _as_utc(dt).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+def determine_allowed_sources(query: str, vendors: list[str]):
+    ql = (query or "").lower()
+    vendor_set = set(vendors)
 
-def _chunks(start: datetime, end: datetime, days: int = 120):
-    cur = start
-    while cur <= end:
-        nxt = min(cur + timedelta(days=days), end)
-        yield cur, nxt
-        cur = nxt + timedelta(seconds=1)
+    wants_discussion = any(term in ql for term in DISCUSSION_HINTS)
+    wants_security = any(term in ql for term in SECURITY_HINTS)
+    wants_release = is_release_query(query)
 
-def expand_vendor_tokens(vendors: list[str]) -> list[str]:
-    synonyms = {
-        "macos": ["macos","os x","apple"], "ios":["ios","apple","iphone","ipad"],
-        "ipados":["ipados","apple"], "watchos":["watchos","apple"], "tvos":["tvos","apple"],
-        "windows":["windows","microsoft"], "edge":["edge","microsoft"],
-        "chrome":["chrome","google","chromium"], "android":["android","google"],
-        "safari":["safari","apple"], "debian":["debian"], "ubuntu":["ubuntu","canonical"],
-        "redhat":["red hat","rhel","redhat"], "openssh":["openssh"], "openssl":["openssl"],
-        "nginx":["nginx","f5"], "apache":["apache","httpd"], "kubernetes":["kubernetes","k8s"],
-        "firefox":["firefox","mozilla"], "postgres":["postgres","postgresql"], "mysql":["mysql","oracle"],
-    }
-    out = set(vendors)
-    for v in list(vendors):
-        out.update(synonyms.get(v, []))
-    return list(out)
+    use_os = False
+    use_reddit = False
+    use_cisa = False
+    atom_keys = []
+    gh_release_repos = []
 
-def fetch_nvd(vendors: list[str], win, limit: int = 20):
     if not vendors:
-        return []
-    # expand + de-noise generic words for NVD keywordSearch
-    vendors = expand_vendor_tokens([v.lower() for v in vendors])
-    noise = {"update","updates","driver","drivers","issue","issues","bug","bugs","chip","chips","latest"}
-    terms = [t for t in vendors if t not in noise] or vendors[:1]
+        return {
+            "use_os": wants_release,
+            "use_reddit": wants_discussion,
+            "use_cisa": wants_security,
+            "atom_keys": [],
+            "gh_release_repos": [],
+        }
 
-    # date window & chunking
-    if not win:
-        end = datetime.now(timezone.utc); start = end - timedelta(days=365)
-    else:
-        start, end = win
+    for v in vendors:
+        if v in GITHUB_VENDOR_REPOS:
+            gh_release_repos.append(GITHUB_VENDOR_REPOS[v])
 
-    results = []
-    per_page = min(200, max(50, limit * 10))
-    hdr = {"apiKey": NVD_API_KEY} if NVD_API_KEY else None
+        if v in ATOM_VENDOR_SOURCES:
+            atom_keys.extend(ATOM_VENDOR_SOURCES[v])
 
-    for s, e in _chunks(start, end, 120):
-        base = {"keywordSearch": " ".join(sorted(set(terms))), "resultsPerPage": per_page}
+    if vendor_set & {"windows", "ubuntu", "debian", "linux", "kernel", "macos", "ios", "android"}:
+        use_os = True
 
-        # Preferred: publication window
-        p = base | {"pubStartDate": _fmt_nvd(s), "pubEndDate": _fmt_nvd(e)}
-        url = f"{NVD_API}?{urlencode(p)}"
-        data = _get_json(url, name="nvd", headers=hdr)
+    if wants_discussion:
+        use_reddit = True
 
-        # Fallback: last-modified window if pub window 404s/empty
-        if data is None or not data.get("vulnerabilities"):
-            p2 = base | {"lastModStartDate": _fmt_nvd(s), "lastModEndDate": _fmt_nvd(e)}
-            url2 = f"{NVD_API}?{urlencode(p2)}"
-            data = _get_json(url2, name="nvd", headers=hdr) or {}
+    if wants_security:
+        use_cisa = True
+        use_os = False
+        atom_keys = []
+        gh_release_repos = []
 
-        for v in (data or {}).get("vulnerabilities", []):
-            c = v.get("cve", {})
-            cve_id = c.get("id", "")
-            descs = c.get("descriptions", []) or []
-            en = next((d.get("value") for d in descs if d.get("lang") == "en"), "") or (descs[0].get("value") if descs else "")
-            refs = c.get("references", []) or []
-            ref_url = next((r.get("url") for r in refs if r.get("url")), "")
-            results.append({"title": cve_id, "url": ref_url, "published": c.get("published"), "summary": en})
-
-        if len(results) >= limit * 10:
-            break
-
-    return results[: limit * 10]
-
-# ── vendor routing (STRICT mode) ------------------------------------------------
-# Minimal router to only query relevant feeds when query explicitly targets a vendor.
-# This prevents irrelevant vendor fetches and reduces noise / latency.
-def determine_sources_for_query(q: str, strict=True):
-    """
-    Return dict: {
-      "use_os": bool,
-      "use_reddit": bool,
-      "nvd_vendors": [tokens],
-      "extra_source_keys": [keys from SOURCES to fetch],
-      "enable_extra": bool
+    return {
+        "use_os": use_os,
+        "use_reddit": use_reddit,
+        "use_cisa": use_cisa,
+        "atom_keys": sorted(set(atom_keys)),
+        "gh_release_repos": sorted(set(gh_release_repos)),
     }
-    In STRICT mode, we pick the most likely sources for the vendor and avoid global github feeds.
-    """
-    ql = (q or "").lower()
-    vendors = extract_vendors(q)
-    res = {"use_os": False, "use_reddit": False, "nvd_vendors": [], "extra_source_keys": [], "enable_extra": False}
-    # Microsoft / Windows → only OS, NVD, CISA, Reddit
-    if any(t in ql for t in ("microsoft", "windows", "patch tuesday", "msrc", "winupdate", "win11", "windows 11")):
-        res["use_os"] = True
-        res["use_reddit"] = True
-        res["nvd_vendors"] = ["windows", "microsoft"]
-        res["extra_source_keys"] = ["cisa_kev"]  # cisa kev helpful for MS CVEs
-        res["enable_extra"] = True
-        return res
 
-    # Ubuntu / Debian / Red Hat → OS, NVD, REDDIT, maybe vendor-specific feeds
-    if any(t in ql for t in ("ubuntu", "debian", "redhat", "rhel", "centos")):
-        res["use_os"] = True
-        res["use_reddit"] = True
-        res["nvd_vendors"] = vendors or [t for t in ["ubuntu","debian","redhat"] if t in ql]
-        res["extra_source_keys"] = ["cisa_kev"]
-        res["enable_extra"] = True
-        return res
-
-    # GitHub project-specific queries (grafana, kubernetes, docker, etc.)
-    gh_keywords = ["grafana","kubernetes","docker","node.js","nodejs","python","pytorch","tensorflow","openssl","nginx"]
-    for k in gh_keywords:
-        if k in ql or k in vendors:
-            res["use_os"] = False
-            res["use_reddit"] = True
-            # pick matching github atom keys
-            keys = []
-            for key in SOURCES:
-                if k in key or k.split(".")[0] in key:
-                    keys.append(key)
-            # fallback to generic github_atom feed list (limited)
-            keys = keys or [sk for sk in SOURCES if "github" in sk][:3]
-            res["extra_source_keys"] = keys
-            res["enable_extra"] = True
-            return res
-
-    # Otherwise: enable full / normal behavior (non-strict fallback)
-    if not strict:
-        res["use_os"] = True
-        res["use_reddit"] = True
-        res["nvd_vendors"] = vendors
-        res["extra_source_keys"] = list(SOURCES.keys())
-        res["enable_extra"] = True
-    else:
-        # STRICT + no clear vendor → only OS + reddit + NVD on extracted vendors (if any)
-        res["use_os"] = True
-        res["use_reddit"] = True
-        res["nvd_vendors"] = vendors
-        res["extra_source_keys"] = ["cisa_kev"] if vendors else []
-        res["enable_extra"] = bool(vendors)
-    return res
-
-# ── retrieval & chat ───────────────────────────────────────────────────────
-def retrieve(query, k):
-    emb = embedder.encode(query, show_progress_bar=False)
-    _, ex = datastore["train"].get_nearest_examples("embeddings", emb, k=k)
-    return ex["text"]
-
-SYSTEM_PROMPT = "Answer using only the provided context. If unsure, say you don’t know."
-
-def call_llm(msgs):
-    prompt = "\n\n".join(f"{m['role'].upper()}:\n{m['content']}" for m in msgs)
-    resp = _gem.invoke(prompt)
-    return getattr(resp, "content", str(resp))
-
-def make_msgs(user_q, ctx_docs):
-    return [
-        {"role":"system","content":SYSTEM_PROMPT},
-        {"role":"system","content":"\n\n".join(f"Document {i+1}:\n{d[:1200]}" for i,d in enumerate(ctx_docs))},
-        {"role":"user","content":user_q},
-    ]
-
-# -------------------- helper to fetch only allowed sources --------------------
-def fetch_allowed_sources_parallel(cfg, allowed_keys, win, vendors, top_k, max_workers=6):
-    """
-    Parallel fetch of allowed_keys. Returns aggregated list of items.
-    Uses fetch_json_generic and fetch_atom_rss helpers in parallel.
-    """
-    if not allowed_keys:
-        return []
-
-    results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {}
-        for key in allowed_keys:
-            if key not in cfg: continue
-            c = cfg[key]
-            if c.get("kind") == "json":
-                futures[ex.submit(fetch_json_generic, c["url"], c.get("json_path", []), c.get("map", {}), key)] = key
-            elif c.get("kind") == "atom":
-                futures[ex.submit(fetch_atom_rss, c["url"], key)] = key
-
-        for fut in as_completed(futures):
-            try:
-                hits = fut.result() or []
-                # annotate source key optionally
-                results.extend(hits)
-            except Exception as e:
-                k = futures.get(fut)
-                # don't spam: use mark or debug
-                st.warning(f"{k} fetch failed: {e}")
-    # apply same time/vendor filter
-    return filter_by_time_and_vendor(results, win, vendors)
 
 # ── UI ──────────────────────────────────────────────────────────────────────
 st.sidebar.button("🔄 Rebuild vector store from API", on_click=lambda: (build_store(), st.cache_resource.clear()))
-st.title("💬 Release-Notes Chat — Live API + RAG")
+st.title("Release Notes Chat")
 
-# Sidebar controls: STRICT checkbox + worker tuning
-STRICT_MODE = st.sidebar.checkbox("STRICT mode (limit live sources to likely matches)", value=True)
-MAX_WORKERS = st.sidebar.slider("Max parallel workers", 2, 16, 8)
+top_k = st.slider("Retrieval depth", 1, 15, 5)
+use_live_api = True
 
-top_k = st.slider("Top-K (RAG & live merge)", 1, 15, 8)
-use_live_api = True  # always on
+if "hist" not in st.session_state:
+    st.session_state.hist = []
 
-if "hist" not in st.session_state: st.session_state.hist = []
-for role, msg in st.session_state.hist: st.chat_message(role).write(msg)
+for role, msg in st.session_state.hist:
+    st.chat_message(role).write(msg)
 
-user_q = st.chat_input("Ask anything (e.g., “Windows driver issues last month”, “NVIDIA updates in March 2024”).")
+user_q = st.chat_input(
+    'Ask anything (e.g., “Windows driver issues last month”, “NVIDIA updates in March 2024”).'
+)
 
 if user_q:
-    st.chat_message("user").write(user_q); st.session_state.hist.append(("user", user_q))
+    t0 = perf_counter()
+    t_live = 0.0
+    t_rag = 0.0
 
-    # start timer for the live + rag path
-    start_time = time.perf_counter()
+    st.chat_message("user").write(user_q)
+    st.session_state.hist.append(("user", user_q))
 
-    # --- Live API path ---
-    live_answer = None
+    vendors = extract_vendors(user_q)
+    route = determine_allowed_sources(user_q, vendors)
+
+    live_answer = ""
+    os_f, rd_f, cisa_f, atom_f, gh_rel_f = [], [], [], [], []
+
     if use_live_api:
         try:
-            # determine sources for the query (STRICT mode)
-            route = determine_sources_for_query(user_q, strict=STRICT_MODE)
-
-            # launch OS/Reddit fetches (blocking small fetches) and mark if present
-            os_raw = _get_json(OS_API, "os") if route["use_os"] else None
-            if os_raw: mark_live("os")
-
-            rd_raw = _get_json(REDDIT_API, "reddit") if route["use_reddit"] else None
-            if rd_raw: mark_live("reddit")
-
-            os_items = _normalize_results(os_raw) if isinstance(os_raw,(list,dict)) else []
-            rd_items = _normalize_results(rd_raw) if isinstance(rd_raw,(list,dict)) else []
-
+            t_live0 = perf_counter()
             win = parse_time_window(user_q)
-            vendors = extract_vendors(user_q)
+
+            os_items = []
+            rd_items = []
+            cisa_items = []
+            atom_items = []
+            gh_rel = []
+
+            if route["use_os"]:
+                os_raw = _get_json(OS_API, "os") or []
+                if os_raw:
+                    mark_live("os")
+                os_items = _normalize_results(os_raw) if isinstance(os_raw, (list, dict)) else []
+
+            if route["use_reddit"]:
+                rd_raw = _get_json(REDDIT_API, "reddit") or []
+                if rd_raw:
+                    mark_live("reddit")
+                rd_items = _normalize_results(rd_raw) if isinstance(rd_raw, (list, dict)) else []
 
             os_f = filter_by_time_and_vendor(os_items, win, vendors)
             rd_f = filter_by_time_and_vendor(rd_items, win, vendors)
 
-            # NVD & extra allowed sources (based on routing)
-            extra_f = []
+            if route["use_cisa"]:
+                cfg = SOURCES["cisa_kev"]
+                kev_hits = fetch_json_generic(cfg["url"], cfg["json_path"], cfg["map"], name="cisa_kev")
+                if kev_hits:
+                    cisa_items += kev_hits
+                    mark_live("cisa_kev")
 
-            # We'll run NVD + allowed source fetches in parallel to reduce latency
-            future_tasks = []
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                # NVD task (only if vendor tokens exist)
-                nvd_future = None
-                if route["nvd_vendors"]:
-                    nvd_future = pool.submit(fetch_nvd, route["nvd_vendors"], win, top_k)
-                # allowed additional sources (parallel)
-                allowed_keys = route.get("extra_source_keys", [])
-                allowed_future = None
-                if allowed_keys:
-                    allowed_future = pool.submit(fetch_allowed_sources_parallel, SOURCES, allowed_keys, win, vendors, top_k, MAX_WORKERS)
+            any_gh_atom = False
+            for key in route["atom_keys"]:
+                cfg = SOURCES.get(key)
+                if cfg and cfg.get("kind") == "atom":
+                    gh = fetch_atom_rss(cfg["url"], name=key)
+                    if gh:
+                        atom_items += gh
+                        any_gh_atom = True
+            if any_gh_atom:
+                mark_live("github_atom")
 
-                # collect results
-                if nvd_future:
-                    try:
-                        nvd_hits = nvd_future.result()
-                        if nvd_hits:
-                            extra_f += nvd_hits
-                            mark_live("nvd")
-                    except Exception as e:
-                        st.warning(f"NVD fetch failed: {e}")
-                if allowed_future:
-                    try:
-                        src_hits = allowed_future.result()
-                        if src_hits:
-                            extra_f += src_hits
-                            for k in allowed_keys:
-                                mark_live(k)
-                    except Exception as e:
-                        st.warning(f"Allowed sources fetch failed: {e}")
+            cisa_f = filter_by_time_and_vendor(cisa_items, win, vendors)
+            atom_f = filter_by_time_and_vendor(atom_items, win, [])
 
-            # If in non-strict fallback we may want to include some github atom feeds (already handled by determine_sources_for_query)
-            sections = [
-                build_grounded_answer("OS Updates & Vulnerabilities", os_f, limit=top_k),
-                build_grounded_answer("Reddit Discussions & Announcements", rd_f, limit=top_k),
-                build_grounded_answer("Other Vendor Feeds (CISA/NVD/GitHub etc.)", extra_f, limit=top_k),
-            ]
-            live_answer = "\n\n---\n\n".join(sections)
+            for repo in route["gh_release_repos"]:
+                gh_rel.extend(fetch_github_releases(repo, limit=60))
+
+            gh_rel_f = filter_by_time_and_vendor(gh_rel, win, [])
+
+            if is_rc_query(user_q):
+                gh_rel_f = filter_rc_only(gh_rel_f)
+
+            if not gh_rel_f and gh_rel:
+                gh_rel_f = gh_rel[:top_k]
+
+            if is_rc_query(user_q) and not gh_rel_f and gh_rel:
+                gh_rel_f = filter_rc_only(gh_rel)
+                gh_rel_f = gh_rel_f[:top_k] if gh_rel_f else gh_rel[:top_k]
+
+            if gh_rel_f:
+                mark_live("github_releases")
+
+            sections = []
+            if route["use_os"] and os_f:
+                sections.append(build_grounded_answer("OS Updates & Vulnerabilities", os_f, limit=top_k))
+            if route["use_reddit"] and rd_f:
+                sections.append(build_grounded_answer("Reddit Discussions & Announcements", rd_f, limit=top_k))
+            if route["use_cisa"] and cisa_f:
+                sections.append(build_grounded_answer("CISA Vulnerability Feed", cisa_f, limit=top_k))
+            if route["atom_keys"] and atom_f:
+                sections.append(build_grounded_answer("GitHub Atom Feed", atom_f, limit=top_k))
+            if route["gh_release_repos"] and gh_rel_f:
+                sections.append(build_grounded_answer("GitHub Releases", gh_rel_f, limit=top_k))
+
+            if sections:
+                live_answer = "\n\n".join(sections)
+            elif gh_rel:
+                fallback_items = gh_rel[:top_k]
+                live_answer = build_grounded_answer("Closest Matching Releases", fallback_items, limit=top_k)
+            else:
+                live_answer = ""
+
+            t_live = perf_counter() - t_live0
+
         except Exception as e:
-            st.warning(f"Live path failed; will still try RAG. {e}")
+            st.warning(f"Live path failed; continuing with RAG. {e}")
 
-    # --- RAG path ---
+    t_rag0 = perf_counter()
     ctx = retrieve(user_q, top_k)
     rag_answer = call_llm(make_msgs(user_q, ctx)) if ctx else ""
+    t_rag = perf_counter() - t_rag0
 
-    # --- Merge ---
-    if live_answer and rag_answer:
-        final = _gem.invoke(
-            "Combine the two answers into one concise, factual reply. "
-            "Do not invent facts. Prefer items that have dates/links. "
-            "Answer directly to the user’s question.\n\n"
-            f"=== LIVE ===\n{live_answer}\n\n=== RAG ===\n{rag_answer}\n\n=== FINAL ==="
+    answer = combine_live_and_rag(user_q, live_answer, rag_answer)
+
+    st.markdown(f'<div class="query-card">{user_q}</div>', unsafe_allow_html=True)
+
+    live_labels = []
+    if gh_rel_f:
+        live_labels.append("github_releases")
+    if atom_f:
+        live_labels.append("github_atom")
+    if cisa_f:
+        live_labels.append("cisa_kev")
+    if os_f:
+        live_labels.append("os")
+    if rd_f:
+        live_labels.append("reddit")
+
+    if live_labels:
+        st.markdown(
+            f'<div class="live-chip">✓ {", ".join(live_labels)}: live</div>',
+            unsafe_allow_html=True
         )
-        answer = getattr(final, "content", f"{live_answer}\n\n---\n\n{rag_answer}")
-    else:
-        answer = live_answer or rag_answer or "_No matching information found._"
 
-    # stop timer and append response time
-    elapsed = time.perf_counter() - start_time
-    # small human-friendly formatting appended to the assistant answer
-    answer = f"{answer}\n\n(Response time: {elapsed:.2f} sec)"
+    st.markdown('<div class="answer-card">', unsafe_allow_html=True)
+    st.markdown(answer)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    st.chat_message("assistant").write(answer)
+    elapsed = perf_counter() - t0
+    st.caption(f"⏱️ Total: **{elapsed:.2f}s** | Live: **{t_live:.2f}s** | RAG: **{t_rag:.2f}s**")
+
     st.session_state.hist.append(("assistant", answer))

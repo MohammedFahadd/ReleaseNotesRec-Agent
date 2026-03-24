@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *.so
 
@@ -10,6 +11,9 @@ __pycache__/
 venv/
 env/
 
+# Streamlit secrets
+.streamlit/
+
 # Vector DB / embeddings
 release_notes_store/
 *.faiss
@@ -17,6 +21,11 @@ release_notes_store/
 
 # Cache
 .live_cache/
+
+# Large files / models
+*.tar.gz
+*.pt
+*.bin
 
 # IDE
 .vscode/
