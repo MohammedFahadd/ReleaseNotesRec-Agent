@@ -1,6 +1,5 @@
 # app.py
-from langchain_google_genai import ChatGoogleGenerativeAI
-ChatGoogleGenerativeAI.model_rebuild()
+from groq import Groq
 
 import os
 import shutil
@@ -98,20 +97,18 @@ a:hover {
 # ── creds ────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-if not GOOGLE_API_KEY:
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+if not GROQ_API_KEY:
     try:
-        GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+        GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
     except Exception:
-        GOOGLE_API_KEY = ""
+        GROQ_API_KEY = ""
 
-if not GOOGLE_API_KEY:
-    st.error("Set GOOGLE_API_KEY in your .env or Streamlit secrets")
+if not GROQ_API_KEY:
+    st.error("Set GROQ_API_KEY in your .env or Streamlit secrets")
     st.stop()
 
-os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
-
-_gem = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+client = Groq(api_key=GROQ_API_KEY)
 
 # ── data / embedding config ─────────────────────────────────────────────────
 CSV_PATH = "SoftwareUpdateSurvey.csv"
@@ -335,7 +332,10 @@ def parse_time_window(q: str, now=None):
 
 def is_release_query(q: str):
     ql = (q or "").lower()
-    release_terms = {"release", "releases", "version", "versions", "update", "updates", "patch", "patches", "announcement", "history"}
+    release_terms = {
+        "release", "releases", "version", "versions", "update",
+        "updates", "patch", "patches", "announcement", "history"
+    }
     return any(term in ql for term in release_terms)
 
 
@@ -589,9 +589,12 @@ SYSTEM_PROMPT = (
 
 
 def call_llm(msgs):
-    prompt = "\n\n".join(f"{m['role'].upper()}:\n{m['content']}" for m in msgs)
-    resp = _gem.invoke(prompt)
-    return getattr(resp, "content", str(resp))
+    resp = client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=msgs,
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content
 
 
 def make_msgs(user_q, ctx_docs):
@@ -630,8 +633,12 @@ Instructions:
 - Do not create a separate Sources section.
 - Keep the tone concise and presentation-ready.
 """
-    resp = _gem.invoke(prompt)
-    return getattr(resp, "content", str(resp))
+    resp = client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content
 
 
 @st.cache_data(ttl=600, show_spinner=False)
