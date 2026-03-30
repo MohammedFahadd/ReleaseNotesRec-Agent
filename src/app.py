@@ -153,14 +153,12 @@ def _get_json(url: str, name: str, headers: dict | None = None):
     cache_path = CACHE_DIR / f"{safe}.json"
 
     sess = requests.Session()
-
     retry = Retry(
         total=2,
         backoff_factor=0.7,
         status_forcelist=(502, 503, 504),
         allowed_methods=["GET"],
     )
-
     adapter = HTTPAdapter(max_retries=retry)
     sess.mount("http://", adapter)
     sess.mount("https://", adapter)
@@ -349,7 +347,6 @@ def extract_vendors(q: str):
         return []
 
     ql = q.lower()
-
     alias_map = {
         "postgresql": "postgresql",
         "postgres": "postgres",
@@ -463,7 +460,6 @@ def build_grounded_answer(title, items, limit=5):
         return ""
 
     lines = []
-
     for it in items[:limit]:
         t = clean_html(it.get("title") or it.get("name") or it.get("versionProductName") or "Untitled")
         url = it.get("url") or it.get("link") or ""
@@ -589,12 +585,16 @@ SYSTEM_PROMPT = (
 
 
 def call_llm(msgs):
-    resp = client.chat.completions.create(
-        model="llama3-70b-8192",
-        messages=msgs,
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content
+    try:
+        resp = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=msgs,
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        st.error(f"Groq call failed: {e}")
+        return ""
 
 
 def make_msgs(user_q, ctx_docs):
@@ -602,7 +602,9 @@ def make_msgs(user_q, ctx_docs):
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "system",
-            "content": "\n\n".join(f"Document {i+1}:\n{d[:1000]}" for i, d in enumerate(ctx_docs)),
+            "content": "\n\n".join(
+                f"Document {i+1}:\n{d[:500]}" for i, d in enumerate(ctx_docs[:3])
+            ),
         },
         {"role": "user", "content": user_q},
     ]
@@ -633,12 +635,16 @@ Instructions:
 - Do not create a separate Sources section.
 - Keep the tone concise and presentation-ready.
 """
-    resp = client.chat.completions.create(
-        model="llama3-70b-8192",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content
+    try:
+        resp = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt[:4000]}],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        st.error(f"Groq summary failed: {e}")
+        return live_answer or rag_answer or "No answer available."
 
 
 @st.cache_data(ttl=600, show_spinner=False)
