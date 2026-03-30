@@ -1,5 +1,6 @@
 # app.py
-from groq import Groq
+from langchain_google_genai import ChatGoogleGenerativeAI
+ChatGoogleGenerativeAI.model_rebuild()
 
 import os
 import shutil
@@ -97,18 +98,20 @@ a:hover {
 # ── creds ────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-if not GROQ_API_KEY:
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+if not GOOGLE_API_KEY:
     try:
-        GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+        GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     except Exception:
-        GROQ_API_KEY = ""
+        GOOGLE_API_KEY = ""
 
-if not GROQ_API_KEY:
-    st.error("Set GROQ_API_KEY in your .env or Streamlit secrets")
+if not GOOGLE_API_KEY:
+    st.error("Set GOOGLE_API_KEY in your .env or Streamlit secrets")
     st.stop()
 
-client = Groq(api_key=GROQ_API_KEY)
+os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+
+_gem = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
 
 # ── data / embedding config ─────────────────────────────────────────────────
 CSV_PATH = "SoftwareUpdateSurvey.csv"
@@ -153,12 +156,14 @@ def _get_json(url: str, name: str, headers: dict | None = None):
     cache_path = CACHE_DIR / f"{safe}.json"
 
     sess = requests.Session()
+
     retry = Retry(
         total=2,
         backoff_factor=0.7,
         status_forcelist=(502, 503, 504),
         allowed_methods=["GET"],
     )
+
     adapter = HTTPAdapter(max_retries=retry)
     sess.mount("http://", adapter)
     sess.mount("https://", adapter)
@@ -330,10 +335,7 @@ def parse_time_window(q: str, now=None):
 
 def is_release_query(q: str):
     ql = (q or "").lower()
-    release_terms = {
-        "release", "releases", "version", "versions", "update",
-        "updates", "patch", "patches", "announcement", "history"
-    }
+    release_terms = {"release", "releases", "version", "versions", "update", "updates", "patch", "patches", "announcement", "history"}
     return any(term in ql for term in release_terms)
 
 
@@ -347,6 +349,7 @@ def extract_vendors(q: str):
         return []
 
     ql = q.lower()
+
     alias_map = {
         "postgresql": "postgresql",
         "postgres": "postgres",
@@ -460,6 +463,7 @@ def build_grounded_answer(title, items, limit=5):
         return ""
 
     lines = []
+
     for it in items[:limit]:
         t = clean_html(it.get("title") or it.get("name") or it.get("versionProductName") or "Untitled")
         url = it.get("url") or it.get("link") or ""
@@ -585,16 +589,9 @@ SYSTEM_PROMPT = (
 
 
 def call_llm(msgs):
-    try:
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=msgs,
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        st.error(f"Groq call failed: {e}")
-        return ""
+    prompt = "\n\n".join(f"{m['role'].upper()}:\n{m['content']}" for m in msgs)
+    resp = _gem.invoke(prompt)
+    return getattr(resp, "content", str(resp))
 
 
 def make_msgs(user_q, ctx_docs):
@@ -602,9 +599,7 @@ def make_msgs(user_q, ctx_docs):
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "system",
-            "content": "\n\n".join(
-                f"Document {i+1}:\n{d[:500]}" for i, d in enumerate(ctx_docs[:3])
-            ),
+            "content": "\n\n".join(f"Document {i+1}:\n{d[:1000]}" for i, d in enumerate(ctx_docs)),
         },
         {"role": "user", "content": user_q},
     ]
@@ -635,16 +630,8 @@ Instructions:
 - Do not create a separate Sources section.
 - Keep the tone concise and presentation-ready.
 """
-    try:
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt[:4000]}],
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        st.error(f"Groq summary failed: {e}")
-        return live_answer or rag_answer or "No answer available."
+    resp = _gem.invoke(prompt)
+    return getattr(resp, "content", str(resp))
 
 
 @st.cache_data(ttl=600, show_spinner=False)
