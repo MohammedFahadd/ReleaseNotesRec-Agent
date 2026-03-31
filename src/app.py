@@ -111,18 +111,23 @@ if not GOOGLE_API_KEY:
 
 os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 
-_gem = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+try:
+    _gem = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+except Exception as e:
+    st.error(f"Gemini initialization failed: {e}")
+    st.stop()
 
-# ── data / embedding config ─────────────────────────────────────────────────
-CSV_PATH = "SoftwareUpdateSurvey.csv"
+# ── absolute paths / config ──────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent.parent
+CSV_PATH = str(BASE_DIR / "SoftwareUpdateSurvey.csv")
 OS_API = "https://releasetrain.io/api/component?q=os"
 REDDIT_API = "https://releasetrain.io/api/reddit"
 MAX_OS, MAX_RED = 50, 50
 EMB_MODEL = "sentence-transformers/all-mpnet-base-v2"
-DATA_DIR = "release_notes_store"
-FAISS_PATH = os.path.join(DATA_DIR, "faiss.index")
+DATA_DIR = str(BASE_DIR / "release_notes_store")
+FAISS_PATH = str(Path(DATA_DIR) / "faiss.index")
 
-CACHE_DIR = Path(".live_cache")
+CACHE_DIR = BASE_DIR / ".live_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
 # -------------------------- one-time status chips ---------------------------
@@ -184,7 +189,10 @@ def _get_json(url: str, name: str, headers: dict | None = None):
         pass
 
     if cache_path.exists():
-        return json.loads(cache_path.read_text())
+        try:
+            return json.loads(cache_path.read_text())
+        except Exception:
+            return None
 
     return None
 
@@ -538,6 +546,9 @@ def build_store():
         name="reddit",
     )
 
+    if not docs:
+        raise ValueError("No documents were loaded for building the vector store.")
+
     model = SentenceTransformer(EMB_MODEL)
     ds = DatasetDict({"train": Dataset.from_dict({"text": [d["text"] for d in docs]})})
     ds = ds.map(
@@ -572,10 +583,19 @@ def get_store():
         return load_store()
 
 
-embedder, datastore = get_store()
+embedder = None
+datastore = None
+store_error = None
+
+try:
+    embedder, datastore = get_store()
+except Exception as e:
+    store_error = str(e)
 
 
 def retrieve(query, k):
+    if embedder is None or datastore is None:
+        return []
     emb = embedder.encode(query, show_progress_bar=False)
     _, ex = datastore["train"].get_nearest_examples("embeddings", emb, k=k)
     return ex["text"]
@@ -589,9 +609,13 @@ SYSTEM_PROMPT = (
 
 
 def call_llm(msgs):
-    prompt = "\n\n".join(f"{m['role'].upper()}:\n{m['content']}" for m in msgs)
-    resp = _gem.invoke(prompt)
-    return getattr(resp, "content", str(resp))
+    try:
+        prompt = "\n\n".join(f"{m['role'].upper()}:\n{m['content']}" for m in msgs)
+        resp = _gem.invoke(prompt)
+        return getattr(resp, "content", str(resp))
+    except Exception as e:
+        st.error(f"Gemini call failed: {e}")
+        return ""
 
 
 def make_msgs(user_q, ctx_docs):
@@ -599,14 +623,15 @@ def make_msgs(user_q, ctx_docs):
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "system",
-            "content": "\n\n".join(f"Document {i+1}:\n{d[:1000]}" for i, d in enumerate(ctx_docs)),
+            "content": "\n\n".join(f"Document {i+1}:\n{d[:800]}" for i, d in enumerate(ctx_docs[:5])),
         },
         {"role": "user", "content": user_q},
     ]
 
 
 def combine_live_and_rag(user_q, live_answer, rag_answer):
-    prompt = f"""
+    try:
+        prompt = f"""
 You are answering a software update question.
 
 User query:
@@ -630,8 +655,11 @@ Instructions:
 - Do not create a separate Sources section.
 - Keep the tone concise and presentation-ready.
 """
-    resp = _gem.invoke(prompt)
-    return getattr(resp, "content", str(resp))
+        resp = _gem.invoke(prompt)
+        return getattr(resp, "content", str(resp))
+    except Exception as e:
+        st.error(f"Gemini summary failed: {e}")
+        return live_answer or rag_answer or "No answer available."
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -810,6 +838,9 @@ def determine_allowed_sources(query: str, vendors: list[str]):
 # ── UI ──────────────────────────────────────────────────────────────────────
 st.sidebar.button("🔄 Rebuild vector store from API", on_click=lambda: (build_store(), st.cache_resource.clear()))
 st.title("Release Notes Chat")
+
+if store_error:
+    st.warning(f"Vector store not available right now: {store_error}")
 
 top_k = st.slider("Retrieval depth", 1, 15, 5)
 use_live_api = True
