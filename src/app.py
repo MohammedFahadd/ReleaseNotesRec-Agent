@@ -112,7 +112,7 @@ if not GOOGLE_API_KEY:
 os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 
 try:
-    _gem = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+    _gem = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.2)
 except Exception as e:
     st.error(f"Gemini initialization failed: {e}")
     st.stop()
